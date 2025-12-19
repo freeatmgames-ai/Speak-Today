@@ -30,9 +30,12 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const checkKey = async () => {
-      const envKey = process.env.API_KEY;
-      const hasSelected = window.aistudio && await window.aistudio.hasSelectedApiKey();
-      if (!envKey && !hasSelected) setIsKeyMissing(true);
+      if (window.aistudio) {
+        const hasSelected = await window.aistudio.hasSelectedApiKey();
+        if (!hasSelected && !process.env.API_KEY) {
+          setIsKeyMissing(true);
+        }
+      }
     };
     checkKey();
   }, []);
@@ -40,6 +43,7 @@ const App: React.FC = () => {
   const handleOpenKeySelector = async () => {
     if (window.aistudio) {
       await window.aistudio.openSelectKey();
+      // Guideline: Assume successful selection after call
       setIsKeyMissing(false);
     }
   };
@@ -51,7 +55,11 @@ const App: React.FC = () => {
     setCallStatus(isReconnect ? 'reconnecting' : 'connecting');
     setErrorMessage(null);
     
-    if (geminiService.current) geminiService.current.stopAll();
+    // Cleanup previous session
+    if (geminiService.current) {
+      geminiService.current.stopAll();
+    }
+    
     geminiService.current = new GeminiLiveService();
     
     if (!isReconnect) setHistory([]);
@@ -74,7 +82,7 @@ const App: React.FC = () => {
           onStatusChange: (status, msg) => {
             setCallStatus(status);
             if (status === 'error') {
-              setErrorMessage(msg || 'Connection lost.');
+              setErrorMessage(msg || 'Network connection failed. Please check your API key and connection.');
             }
           },
           onKeyRequired: () => {
@@ -84,8 +92,9 @@ const App: React.FC = () => {
         }
       );
     } catch (err: any) {
+      console.error("Start call failed:", err);
       setCallStatus('error');
-      setErrorMessage(err.message || "Failed to connect.");
+      setErrorMessage(err.message || "Network error. Please try again.");
     }
   };
 

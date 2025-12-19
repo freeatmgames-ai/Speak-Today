@@ -46,6 +46,10 @@ export class GeminiLiveService {
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       this.outAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
 
+      // Browsers require explicit resume after user gesture
+      await this.audioContext.resume();
+      await this.outAudioContext.resume();
+
       const memoryContext = history.length > 0 
         ? `Previous conversation summary: ${history.slice(-3).map(h => h.text).join(' -> ')}. Continue naturally.`
         : "Start a new conversation.";
@@ -91,11 +95,12 @@ export class GeminiLiveService {
           },
           onerror: (e: any) => {
             console.error('Gemini Live Error:', e);
-            if (e?.message?.includes('entity was not found') || e?.message?.includes('API_KEY')) {
+            const errorMsg = e?.message || e?.reason || '';
+            if (errorMsg.includes('entity was not found') || errorMsg.includes('API_KEY') || errorMsg.includes('404')) {
               callbacks.onKeyRequired?.();
             }
             if (this.isActive) {
-              callbacks.onStatusChange('error', "Connection interrupted. Retrying...");
+              callbacks.onStatusChange('error', errorMsg || "Network connection error.");
             }
           },
           onclose: (e: CloseEvent) => {
@@ -108,10 +113,15 @@ export class GeminiLiveService {
         }
       });
 
+      // Wait for the initial connection attempt
       await this.sessionPromise;
     } catch (err: any) {
+      const errorMsg = err?.message || '';
+      if (errorMsg.includes('Requested entity was not found') || errorMsg.includes('404')) {
+        callbacks.onKeyRequired?.();
+      }
       this.isActive = false;
-      callbacks.onStatusChange('error', err.message);
+      callbacks.onStatusChange('error', errorMsg || "Failed to establish network connection.");
       throw err;
     }
   }
