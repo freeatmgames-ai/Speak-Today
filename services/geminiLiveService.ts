@@ -29,7 +29,12 @@ export class GeminiLiveService {
     try {
       callbacks.onStatusChange('connecting');
 
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+      const apiKey = process.env.API_KEY;
+      if (!apiKey) {
+        throw new Error('API Key is missing. Please set the API_KEY environment variable in your Vercel/deployment dashboard.');
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
 
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       this.outAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
@@ -81,7 +86,6 @@ export class GeminiLiveService {
           onopen: () => {
             callbacks.onStatusChange('open');
             this.startMicStreaming(stream, sessionPromise);
-            // Prevention for idle timeouts
             this.keepAliveInterval = window.setInterval(() => {
               if (this.audioContext?.state === 'suspended') {
                 this.audioContext.resume();
@@ -97,15 +101,15 @@ export class GeminiLiveService {
             if (e instanceof Error) errorMsg = e.message;
             else if (e && e.message) errorMsg = e.message;
             else if (typeof e === 'string') errorMsg = e;
+            else if (e && e.type === 'error') errorMsg = 'The connection was interrupted by the server.';
             else errorMsg = JSON.stringify(e);
             
             callbacks.onStatusChange('error', errorMsg);
           },
           onclose: (e: CloseEvent) => {
             console.debug('Gemini Live Connection closed:', e);
-            // Status code 1006 usually means unexpected drop (timeout/network)
             if (e.code === 1006 || e.code === 1011) {
-              callbacks.onStatusChange('error', `Connection lost (Code ${e.code}). This often happens after 2-5 minutes in preview versions.`);
+              callbacks.onStatusChange('error', `Connection lost (Code ${e.code}). This is a common preview limit.`);
             } else {
               callbacks.onStatusChange('closed');
             }
