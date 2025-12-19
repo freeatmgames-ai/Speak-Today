@@ -1,11 +1,11 @@
 
 import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
 import { createBlob, decode, decodeAudioData } from '../utils/audioUtils';
-import { Avatar, EnglishLevel, PracticeType } from '../types';
+import { Avatar, EnglishLevel, PracticeType, ChatTurn } from '../types';
 
 export interface LiveSessionCallbacks {
   onTranscriptionUpdate: (role: 'user' | 'model', text: string, isComplete: boolean) => void;
-  onStatusChange: (status: 'connecting' | 'open' | 'closed' | 'error', message?: string) => void;
+  onStatusChange: (status: 'connecting' | 'open' | 'closed' | 'error' | 'reconnecting', message?: string) => void;
 }
 
 export class GeminiLiveService {
@@ -24,17 +24,14 @@ export class GeminiLiveService {
     avatar: Avatar,
     level: EnglishLevel,
     mode: PracticeType,
+    history: ChatTurn[],
     callbacks: LiveSessionCallbacks
   ) {
     try {
-      callbacks.onStatusChange('connecting');
+      callbacks.onStatusChange(history.length > 0 ? 'reconnecting' : 'connecting');
 
       const apiKey = process.env.API_KEY;
-      if (!apiKey) {
-        throw new Error('API Key is missing. Please set the API_KEY environment variable in your Vercel/deployment dashboard.');
-      }
-
-      const ai = new GoogleGenAI({ apiKey });
+      const ai = new GoogleGenAI({ apiKey: apiKey || '' });
 
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       this.outAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
@@ -42,31 +39,20 @@ export class GeminiLiveService {
       await this.audioContext.resume();
       await this.outAudioContext.resume();
 
+      // Create memory of previous conversation
+      const memoryPrompt = history.length > 0 
+        ? `\n\nCONTINUATION: We are continuing an ongoing conversation. 
+           HISTORY SUMMARY:
+           ${history.slice(-5).map(h => `${h.role === 'user' ? 'User' : 'Coach'}: ${h.text}`).join('\n')}
+           \nPick up naturally from where we left off.`
+        : "";
+
       const systemInstruction = `
-        ROLE: You are ${avatar.name}, a multilingual AI English Speaking Coach.
-        PERSONALITY: ${avatar.tone} 
-        SPEAKING SPEED: ${avatar.speed}. 
-        TARGET LEVEL: ${level}.
-        PRACTICE MODE: ${mode}.
-
-        MULTILINGUAL CAPABILITIES:
-        - You fully understand English, Hindi (Hinglish), and Gujarati (Gujlish).
-        - If the user speaks Hindi or Gujarati, understand the meaning perfectly.
-        - CRITICAL RULE: ALWAYS respond ONLY in English. Never speak Hindi or Gujarati yourself.
-        
-        FEEDBACK LOGIC:
-        1. If user speaks in Hindi/Gujarati: Acknowledge you understood, then explain the English equivalent.
-        2. If user speaks broken English: Correct politely.
-        3. Motivation is key. Say "You're doing great!" often.
-        
-        RESPONSE FORMAT (Spoken & Text):
-        ✔ [What they did well / That was great!]
-        ✏ [Small correction if needed]
-        ⭐ [Improved English sentence: "Instead of '...', you can say '...'"]
-        ❓ [Next speaking question]
-
-        MISSION: Help users transition from their native language to fluent English.
-        NEVER end the conversation unless the user says "stop".
+        ROLE: You are ${avatar.name}, an English Speaking Coach.
+        PERSONALITY: ${avatar.tone}. 
+        MISSION: Improve user's fluency. Understand English, Hindi, and Gujarati, but ALWAYS respond ONLY in English.
+        Current Level: ${level}. Practice Mode: ${mode}.
+        ${memoryPrompt}
       `;
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -86,30 +72,27 @@ export class GeminiLiveService {
           onopen: () => {
             callbacks.onStatusChange('open');
             this.startMicStreaming(stream, sessionPromise);
+            
+            // Aggressive keep-alive to prevent idling
             this.keepAliveInterval = window.setInterval(() => {
-              if (this.audioContext?.state === 'suspended') {
-                this.audioContext.resume();
-              }
-            }, 10000);
+              if (this.audioContext?.state === 'suspended') this.audioContext.resume();
+              // Send a tiny bit of noise if silent to keep pipe open (optional but helpful)
+            }, 3000);
           },
           onmessage: async (message: LiveServerMessage) => {
             this.handleMessage(message, callbacks);
           },
           onerror: (e: any) => {
-            console.error('Gemini Live Error:', e);
-            let errorMsg = 'Unknown connection error';
-            if (e instanceof Error) errorMsg = e.message;
-            else if (e && e.message) errorMsg = e.message;
-            else if (typeof e === 'string') errorMsg = e;
-            else if (e && e.type === 'error') errorMsg = 'The connection was interrupted by the server.';
-            else errorMsg = JSON.stringify(e);
-            
-            callbacks.onStatusChange('error', errorMsg);
+            console.error('Session Error:', e);
+            let msg = "Network interrupted.";
+            if (e.message) msg = e.message;
+            callbacks.onStatusChange('error', msg);
           },
           onclose: (e: CloseEvent) => {
-            console.debug('Gemini Live Connection closed:', e);
-            if (e.code === 1006 || e.code === 1011) {
-              callbacks.onStatusChange('error', `Connection lost (Code ${e.code}). This is a common preview limit.`);
+            console.debug('Session closed with code:', e.code);
+            // 1006 is the standard "unexpected/timeout" code for the 2-min limit
+            if (e.code === 1006 || e.code === 1011 || e.code === 1001) {
+              callbacks.onStatusChange('reconnecting', "Refreshing connection to allow unlimited speaking...");
             } else {
               callbacks.onStatusChange('closed');
             }
@@ -119,11 +102,9 @@ export class GeminiLiveService {
       });
 
       this.session = await sessionPromise;
-    } catch (err) {
-      console.error('Failed to connect to Gemini Live:', err);
-      let errorMsg = 'Failed to initialize session';
-      if (err instanceof Error) errorMsg = err.message;
-      callbacks.onStatusChange('error', errorMsg);
+    } catch (err: any) {
+      console.error('Connect Error:', err);
+      callbacks.onStatusChange('error', err.message || 'Failed to connect.');
     }
   }
 
@@ -137,11 +118,7 @@ export class GeminiLiveService {
       const pcmBlob = createBlob(inputData);
       sessionPromise.then((session) => {
         if (session) {
-          try {
-            session.sendRealtimeInput({ media: pcmBlob });
-          } catch (err) {
-            console.error('Error sending mic data:', err);
-          }
+          try { session.sendRealtimeInput({ media: pcmBlob }); } catch(err) {}
         }
       });
     };
@@ -155,17 +132,13 @@ export class GeminiLiveService {
       this.currentInputTranscription += message.serverContent.inputTranscription.text;
       callbacks.onTranscriptionUpdate('user', this.currentInputTranscription, false);
     }
-    
     if (message.serverContent?.outputTranscription) {
       this.currentOutputTranscription += message.serverContent.outputTranscription.text;
       callbacks.onTranscriptionUpdate('model', this.currentOutputTranscription, false);
     }
-
     if (message.serverContent?.turnComplete) {
-      const uText = this.currentInputTranscription;
-      const mText = this.currentOutputTranscription;
-      callbacks.onTranscriptionUpdate('user', uText, true);
-      callbacks.onTranscriptionUpdate('model', mText, true);
+      callbacks.onTranscriptionUpdate('user', this.currentInputTranscription, true);
+      callbacks.onTranscriptionUpdate('model', this.currentOutputTranscription, true);
       this.currentInputTranscription = '';
       this.currentOutputTranscription = '';
     }
@@ -174,38 +147,21 @@ export class GeminiLiveService {
     if (audioData && this.outAudioContext) {
       this.nextStartTime = Math.max(this.nextStartTime, this.outAudioContext.currentTime);
       const buffer = await decodeAudioData(decode(audioData), this.outAudioContext, 24000, 1);
-      
       const source = this.outAudioContext.createBufferSource();
       source.buffer = buffer;
       source.connect(this.outAudioContext.destination);
-      source.addEventListener('ended', () => this.sources.delete(source));
       source.start(this.nextStartTime);
       this.nextStartTime += buffer.duration;
       this.sources.add(source);
-    }
-
-    if (message.serverContent?.interrupted) {
-      this.sources.forEach(s => {
-        try { s.stop(); } catch(e) {}
-      });
-      this.sources.clear();
-      this.nextStartTime = 0;
+      source.onended = () => this.sources.delete(source);
     }
   }
 
   stopAll() {
-    if (this.keepAliveInterval) {
-      clearInterval(this.keepAliveInterval);
-      this.keepAliveInterval = null;
-    }
-    this.sources.forEach(s => {
-      try { s.stop(); } catch(e) {}
-    });
+    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+    this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
     this.sources.clear();
-    if (this.session) {
-      try { this.session.close(); } catch(e) {}
-      this.session = null;
-    }
+    if (this.session) { try { this.session.close(); } catch(e) {} }
     this.audioContext?.close().catch(() => {});
     this.outAudioContext?.close().catch(() => {});
   }
