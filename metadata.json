@@ -1,0 +1,7 @@
+{
+  "name": "SpeakFlow AI English Coach",
+  "description": "A high-fidelity AI English speaking coach featuring real-time voice-to-voice conversation, multiple AI avatars, and personalized feedback to improve fluency.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
