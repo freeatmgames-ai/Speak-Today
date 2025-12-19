@@ -4,22 +4,22 @@ import { createBlob, decode, decodeAudioData } from '../utils/audioUtils';
 import { Avatar, EnglishLevel, PracticeType, ChatTurn } from '../types';
 
 export interface LiveSessionCallbacks {
-  onTranscriptionUpdate: (role: 'user' | 'model', text: string, isComplete: boolean) => void;
+  onTranscriptionUpdate: (role: 'user' | 'model', text: string, isComplete: boolean, confidence?: number) => void;
   onStatusChange: (status: 'connecting' | 'open' | 'closed' | 'error' | 'reconnecting', message?: string) => void;
+  onKeyRequired?: () => void;
 }
 
 export class GeminiLiveService {
-  private session: any | null = null;
   private audioContext: AudioContext | null = null;
   private outAudioContext: AudioContext | null = null;
   private nextStartTime = 0;
   private sources = new Set<AudioBufferSourceNode>();
   private currentInputTranscription = '';
   private currentOutputTranscription = '';
-  private keepAliveInterval: number | null = null;
   private micStream: MediaStream | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
   private isActive = false;
+  private sessionPromise: Promise<any> | null = null;
 
   constructor() {}
 
@@ -35,26 +35,40 @@ export class GeminiLiveService {
       callbacks.onStatusChange(history.length > 0 ? 'reconnecting' : 'connecting');
 
       const apiKey = process.env.API_KEY;
-      if (!apiKey) throw new Error("API Key missing");
+      if (!apiKey) {
+        callbacks.onKeyRequired?.();
+        throw new Error("API Key missing");
+      }
       
+      // Always create a new instance to ensure we have the latest key
       const ai = new GoogleGenAI({ apiKey });
 
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       this.outAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
 
-      await this.audioContext.resume();
-      await this.outAudioContext.resume();
+      const memoryContext = history.length > 0 
+        ? `Previous conversation summary: ${history.slice(-3).map(h => h.text).join(' -> ')}. Continue naturally.`
+        : "Start a new conversation.";
 
-      // Ensure the AI knows this is a continuous conversation to avoid repetitive greetings
-      const memoryPrompt = history.length > 0 
-        ? `\n\n[SYSTEM: CONNECTION REFRESHED. DO NOT GREET THE USER AGAIN. CONTINUE THE PREVIOUS CONVERSATION NATURALLY. Last few sentences: ${history.slice(-2).map(h => h.text).join(' | ')}]`
-        : "";
+      const levelInstructions = {
+        'Basic': 'Use extremely simple vocabulary, short sentences, and speak very slowly. Focus on basic greetings and everyday objects.',
+        'Intermediate': 'Use natural conversational English with common idioms. Correct small grammar mistakes gently.',
+        'Advanced': 'Use sophisticated vocabulary and complex sentence structures. Provide high-level feedback on nuances.'
+      };
 
-      const systemInstruction = `You are ${avatar.name}, an English coach. Tone: ${avatar.tone}. Level: ${level}. Focus: ${mode}. Understand English/Hindi/Gujarati, but respond ONLY in English. ${memoryPrompt}`;
+      const systemInstruction = `
+        ROLE: You are ${avatar.name}, an English Speaking Coach. 
+        PERSONALITY: ${avatar.tone}. 
+        LEVEL: ${level}. ${levelInstructions[level]}
+        PRACTICE MODE: ${mode}.
+        STYLE: Conduct this as a friendly phone call. 
+        FEEDBACK: Occasionally mention what the user did well or how to improve a sentence naturally in conversation.
+        CONTEXT: ${memoryContext}
+      `;
 
       this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-      const sessionPromise = ai.live.connect({
+      this.sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
@@ -69,61 +83,58 @@ export class GeminiLiveService {
           onopen: () => {
             if (!this.isActive) return;
             callbacks.onStatusChange('open');
-            this.startMicStreaming(sessionPromise);
-            this.keepAliveInterval = window.setInterval(() => {
-              if (this.audioContext?.state === 'suspended') this.audioContext?.resume();
-            }, 3000);
+            this.startMicStreaming();
           },
           onmessage: async (message: LiveServerMessage) => {
             if (!this.isActive) return;
             this.handleMessage(message, callbacks);
           },
           onerror: (e: any) => {
-            console.error('Socket Error:', e);
+            console.error('Gemini Live Error:', e);
+            if (e?.message?.includes('entity was not found') || e?.message?.includes('API_KEY')) {
+              callbacks.onKeyRequired?.();
+            }
             if (this.isActive) {
-              callbacks.onStatusChange('error', "Connection issue. Retrying...");
+              callbacks.onStatusChange('error', "Connection interrupted. Retrying...");
             }
           },
           onclose: (e: CloseEvent) => {
-            const wasActive = this.isActive;
-            this.stopAll(); // Cleanup immediately
-            
-            if (wasActive && (e.code === 1006 || e.code === 1011 || e.code === 1001)) {
-              // Server-side timeout (the 2-min limit)
+            if (this.isActive) {
               callbacks.onStatusChange('reconnecting');
-            } else if (wasActive) {
+            } else {
               callbacks.onStatusChange('closed');
             }
           }
         }
       });
 
-      this.session = await sessionPromise;
+      await this.sessionPromise;
     } catch (err: any) {
       this.isActive = false;
-      callbacks.onStatusChange('error', err.message || 'Connect failed');
+      callbacks.onStatusChange('error', err.message);
       throw err;
     }
   }
 
-  private startMicStreaming(sessionPromise: Promise<any>) {
-    if (!this.audioContext || !this.micStream) return;
+  private startMicStreaming() {
+    if (!this.audioContext || !this.micStream || !this.sessionPromise) return;
     
     const source = this.audioContext.createMediaStreamSource(this.micStream);
     this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
 
     this.scriptProcessor.onaudioprocess = (e) => {
-      if (!this.isActive || !this.session) return;
+      if (!this.isActive) return;
       
       const inputData = e.inputBuffer.getChannelData(0);
       const pcmBlob = createBlob(inputData);
       
-      sessionPromise.then((session) => {
-        if (this.isActive && session && session.sendRealtimeInput) {
+      // CRITICAL: Solely rely on sessionPromise resolves
+      this.sessionPromise?.then((session) => {
+        if (this.isActive && session) {
           try {
             session.sendRealtimeInput({ media: pcmBlob });
           } catch (err) {
-            // Drop frames silently during closing
+            console.warn("Input stream failed", err);
           }
         }
       });
@@ -171,9 +182,6 @@ export class GeminiLiveService {
 
   stopAll() {
     this.isActive = false;
-    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-    this.keepAliveInterval = null;
-    
     this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
     this.sources.clear();
 
@@ -187,12 +195,8 @@ export class GeminiLiveService {
       this.micStream = null;
     }
 
-    if (this.session) {
-      try { this.session.close(); } catch(e) {}
-      this.session = null;
-    }
-
     this.audioContext?.close().catch(() => {});
     this.outAudioContext?.close().catch(() => {});
+    this.sessionPromise = null;
   }
 }

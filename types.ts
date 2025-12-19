@@ -23,4 +23,5 @@ export interface ChatTurn {
   role: 'user' | 'model';
   text: string;
   timestamp: number;
+  confidence?: number;
 }
